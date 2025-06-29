@@ -3,7 +3,7 @@ import passport from 'passport';
 import { Strategy as GoogleStrategy } from 'passport-google-oauth20';
 import dotenv from 'dotenv';
 import session from 'express-session';
-import { initDatabase, findOrCreateUser, findUserById, getBots, addMessage, getMessagesForUserBot, addBot, updateBot, deleteBot, getBotById, checkMessageLimit, getActivatedBotsForUser, activateBotForUser, addActivationKey, getConversationsForUserBot, deleteConversation, updateConversationTitle, getConversationById, addConversation, saveUserBotPreferences, getUserBotPreferences } from './database.js';
+import { initDatabase, findOrCreateUser, findUserById, getBots, addMessage, getMessagesForUserBot, addBot, updateBot, deleteBot, getBotById, checkMessageLimit, getActivatedBotsForUser, activateBotForUser, addActivationKey, getConversationsForUserBot, deleteConversation, updateConversationTitle, getConversationById, addConversation, saveUserBotPreferences, getUserBotPreferences, getMySQLUserId, syncUserToMySQL, updateUserMySQLId } from './database.js';
 import cors from 'cors';
 import openai from './openai.js';
 
@@ -115,7 +115,8 @@ app.get('/auth/status', async (req, res) => {
       id: req.user.id, 
       name: req.user.name, 
       email: req.user.email, 
-      activatedBots: activatedBots.map(bot => bot.id) 
+      activatedBots: activatedBots.map(bot => bot.id),
+      mysql_id: req.user.mysql_id
     };
     console.log('/auth/status - Envoi de la réponse user (authentifié): ', responseUser);
     res.status(200).json({ user: responseUser });
@@ -536,6 +537,74 @@ app.get('/api/messages/:botId/:conversationId/search', isAuthenticated, async (r
   } catch (error) {
     console.error('Erreur lors de la recherche de messages:', error);
     res.status(500).send('Erreur interne du serveur.');
+  }
+});
+
+// Route pour récupérer l'ID MySQL d'un utilisateur connecté
+app.get('/api/user/mysql-id', isAuthenticated, (req, res) => {
+  try {
+    const mysqlUserId = getMySQLUserId(req.user.id);
+    if (mysqlUserId) {
+      res.json({ success: true, mysqlUserId });
+    } else {
+      res.status(404).json({ success: false, message: 'ID MySQL non trouvé pour cet utilisateur' });
+    }
+  } catch (error) {
+    console.error('Erreur récupération ID MySQL:', error);
+    res.status(500).json({ success: false, message: 'Erreur serveur' });
+  }
+});
+
+// Route de test pour forcer la synchronisation d'un utilisateur vers MySQL
+app.get('/api/test/sync-user', isAuthenticated, async (req, res) => {
+  try {
+    console.log('🔄 Test de synchronisation forcée pour:', req.user.name);
+    
+    // Forcer la synchronisation
+    const mysqlUserId = await syncUserToMySQL(req.user.id, req.user.name, req.user.email);
+    
+    if (mysqlUserId) {
+      // Mettre à jour l'utilisateur SQLite avec l'ID MySQL
+      updateUserMySQLId(req.user.id, mysqlUserId);
+      console.log('✅ Synchronisation forcée réussie:', mysqlUserId);
+      
+      res.json({ 
+        success: true, 
+        message: 'Synchronisation réussie',
+        mysqlUserId,
+        user: req.user
+      });
+    } else {
+      res.status(500).json({ 
+        success: false, 
+        message: 'Échec de la synchronisation'
+      });
+    }
+  } catch (error) {
+    console.error('❌ Erreur synchronisation forcée:', error);
+    res.status(500).json({ 
+      success: false, 
+      message: 'Erreur serveur',
+      error: error.message
+    });
+  }
+});
+
+// Route pour créer une nouvelle conversation
+app.post('/api/conversations', isAuthenticated, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { botId, title } = req.body;
+    if (!botId) {
+      return res.status(400).json({ message: 'botId requis' });
+    }
+    const convTitle = title || 'Nouvelle conversation';
+    const conversationId = await addConversation(userId, botId, convTitle);
+    const conversation = getConversationById(conversationId);
+    res.status(201).json(conversation);
+  } catch (error) {
+    console.error('Erreur lors de la création de la conversation:', error);
+    res.status(500).json({ message: 'Erreur lors de la création de la conversation.' });
   }
 });
 

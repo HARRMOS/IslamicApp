@@ -16,7 +16,8 @@ const initDatabase = () => {
       id TEXT PRIMARY KEY,
       googleId TEXT UNIQUE,
       name TEXT,
-      email TEXT UNIQUE
+      email TEXT UNIQUE,
+      mysql_id TEXT
     );
 
     CREATE TABLE IF NOT EXISTS bots (
@@ -82,6 +83,17 @@ const initDatabase = () => {
       FOREIGN KEY (botId) REFERENCES bots(id) ON DELETE CASCADE
     );
   `);
+  
+  // Ajouter la colonne mysql_id si elle n'existe pas déjà
+  try {
+    db.exec('ALTER TABLE users ADD COLUMN mysql_id TEXT');
+    console.log('✅ Colonne mysql_id ajoutée à la table users');
+  } catch (error) {
+    // La colonne existe déjà, c'est normal
+    console.log('ℹ️ Colonne mysql_id existe déjà');
+  }
+  
+  console.log('✅ Base de données SQLite initialisée');
 
   // Vérifier et ajouter la colonne status si nécessaire
   try {
@@ -125,8 +137,6 @@ const initDatabase = () => {
     db.exec('ALTER TABLE messages ADD COLUMN title TEXT');
   }
 
-  console.log('Database initialized and tables ensured.');
-
   // Insérer des bots par défaut si la table est vide
   const botsCount = db.prepare('SELECT COUNT(*) FROM bots').get()['COUNT(*)'];
   if (botsCount === 0) {
@@ -138,23 +148,110 @@ const initDatabase = () => {
   }
 };
 
-// Fonction pour trouver ou créer un utilisateur
+// Fonction pour synchroniser un utilisateur vers la base MySQL (avec fetch)
+const syncUserToMySQL = async (googleId, name, email) => {
+  try {
+    const response = await fetch('http://localhost:3001/api/users', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        email: email,
+        username: name,
+        preferences: {
+          theme: 'default',
+          arabicFont: 'Amiri',
+          arabicFontSize: '2.5rem',
+          reciter: 'mishary_rashid_alafasy'
+        }
+      })
+    });
+
+    if (response.ok) {
+      const result = await response.json();
+      console.log('✅ Utilisateur synchronisé vers MySQL:', result.user.id);
+      // Initialiser les stats à 0 pour ce nouvel utilisateur
+      try {
+        await fetch('http://localhost:3001/api/stats', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            userId: result.user.id,
+            hasanat: 0,
+            verses: 0,
+            time: 0,
+            pages: 0
+          })
+        });
+        console.log('✅ Stats initialisées à 0 pour l\'utilisateur MySQL:', result.user.id);
+      } catch (err) {
+        console.error('❌ Erreur lors de l\'initialisation des stats:', err);
+      }
+      return result.user.id; // Retourner l'ID MySQL
+    } else {
+      console.error('❌ Erreur synchronisation MySQL:', response.statusText);
+      return null;
+    }
+  } catch (error) {
+    console.error('❌ Erreur réseau synchronisation MySQL:', error);
+    return null;
+  }
+};
+
+// Fonction pour trouver ou créer un utilisateur (synchrone pour Passport)
 const findOrCreateUser = (googleId, name, email) => {
   const user = db.prepare('SELECT * FROM users WHERE googleId = ?').get(googleId);
 
   if (user) {
     console.log('User found:', user);
+    
+    // Vérifier si l'utilisateur a déjà un ID MySQL, sinon le synchroniser
+    if (!user.mysql_id) {
+      console.log('🔄 Utilisateur existant sans ID MySQL, synchronisation...');
+      // Utiliser une IIFE async pour ne pas bloquer
+      (async () => {
+        try {
+          const mysqlUserId = await syncUserToMySQL(googleId, name, email);
+          if (mysqlUserId) {
+            // Mettre à jour l'utilisateur SQLite avec l'ID MySQL
+            db.prepare('UPDATE users SET mysql_id = ? WHERE id = ?').run(mysqlUserId, googleId);
+            console.log('✅ ID MySQL ajouté à l\'utilisateur existant:', mysqlUserId);
+          }
+        } catch (error) {
+          console.error('❌ Erreur synchronisation MySQL pour utilisateur existant:', error);
+        }
+      })();
+    }
+    
     return user;
   } else {
     console.log('User not found, creating new user...');
+    
+    // Créer l'utilisateur dans SQLite
     const newUser = db.prepare('INSERT INTO users (id, googleId, name, email) VALUES (?, ?, ?, ?)').run(
-      googleId, // Utiliser googleId comme id interne ou générer un autre UUID si préféré
+      googleId,
       googleId,
       name,
       email
     );
     const createdUser = db.prepare('SELECT * FROM users WHERE id = ?').get(googleId);
-    console.log('User created:', createdUser);
+    console.log('User created in SQLite:', createdUser);
+    
+    // Synchroniser vers MySQL en arrière-plan (ne pas bloquer)
+    (async () => {
+      try {
+        const mysqlUserId = await syncUserToMySQL(googleId, name, email);
+        if (mysqlUserId) {
+          // Mettre à jour l'utilisateur SQLite avec l'ID MySQL
+          db.prepare('UPDATE users SET mysql_id = ? WHERE id = ?').run(mysqlUserId, googleId);
+          console.log('✅ ID MySQL ajouté à l\'utilisateur SQLite:', mysqlUserId);
+        }
+      } catch (error) {
+        console.error('❌ Erreur synchronisation MySQL:', error);
+      }
+    })();
+    
     return createdUser;
   }
 };
@@ -467,7 +564,7 @@ export function saveUserBotPreferences(userId, botId, preferences) {
 }
 
 // Nouvelle fonction pour récupérer les préférences utilisateur par bot
-export function getUserBotPreferences(userId, botId) {
+const getUserBotPreferences = (userId, botId) => {
   const preference = db.prepare('SELECT preferences FROM user_bot_preferences WHERE userId = ? AND botId = ?').get(userId, botId);
   if (preference) {
     try {
@@ -478,19 +575,33 @@ export function getUserBotPreferences(userId, botId) {
     }
   }
   return null; // Retourner null si aucune préférence n'est trouvée
-}
+};
+
+// Fonction pour récupérer l'ID MySQL d'un utilisateur
+const getMySQLUserId = (googleId) => {
+  const user = db.prepare('SELECT mysql_id FROM users WHERE googleId = ?').get(googleId);
+  return user ? user.mysql_id : null;
+};
+
+// Fonction pour mettre à jour l'ID MySQL d'un utilisateur
+const updateUserMySQLId = (googleId, mysqlId) => {
+  const stmt = db.prepare('UPDATE users SET mysql_id = ? WHERE googleId = ?');
+  const result = stmt.run(mysqlId, googleId);
+  return result.changes > 0;
+};
 
 export { 
   initDatabase, 
   findOrCreateUser, 
   findUserById, 
+  getAllUsers, 
   getBots, 
+  getBotById, 
   addMessage, 
   getMessagesForUserBot, 
-  getBotById, 
   checkMessageLimit, 
-  activateBotForUser, 
   getActivatedBotsForUser, 
+  activateBotForUser, 
   addActivationKey, 
   getConversationsForUserBot,
   deleteConversation,
@@ -498,5 +609,9 @@ export {
   searchMessages,
   addConversation,
   updateConversationStatus,
-  getConversationById
+  getConversationById,
+  getUserBotPreferences,
+  getMySQLUserId,
+  syncUserToMySQL,
+  updateUserMySQLId
 }; 
